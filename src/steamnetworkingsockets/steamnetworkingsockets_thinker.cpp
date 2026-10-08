@@ -182,12 +182,14 @@ SteamNetworkingMicroseconds IThinker::Thinker_GetNextScheduledThinkTime()
 	return usecResult;
 }
 
-void IThinker::Thinker_ProcessThinkers()
+void IThinker::Thinker_ProcessThinkers( SteamNetworkingMicroseconds usecBudget )
 {
 	// We need the lock to access the thinker queue
 	s_mutexThinkerTable.lock();
 
-	// Until the queue is empty
+	const SteamNetworkingMicroseconds usecDeadline = usecBudget > 0
+		? SteamNetworkingSockets_GetLocalTimestamp() + usecBudget : INT64_MAX;
+	// Until the queue is empty or this pass has consumed its budget.
 	int nIterations = 0;
 	while ( s_queueThinkers.Count() > 0 )
 	{
@@ -202,6 +204,11 @@ void IThinker::Thinker_ProcessThinkers()
 		// in our next iteration, we will use an older timestamp to process
 		// a thinker.
 		SteamNetworkingMicroseconds usecNow = SteamNetworkingSockets_GetLocalTimestamp();
+
+		// The remaining due thinkers stay in the same ordered queue. They
+		// resume after the socket service gets an opportunity to process I/O.
+		if ( nIterations > 0 && usecNow >= usecDeadline )
+			break;
 
 		// Scheduled too far in the future?
 		if ( pNextThinker->GetNextThinkTime() >= usecNow )

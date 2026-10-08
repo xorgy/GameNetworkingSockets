@@ -5,6 +5,11 @@ include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 find_dependency(Protobuf)
 
+if(@USE_IO_URING@)
+    find_dependency(PkgConfig)
+    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.4)
+endif()
+
 if(@USE_CRYPTO@ STREQUAL "OpenSSL")
     find_dependency(OpenSSL)
 endif()

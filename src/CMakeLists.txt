@@ -299,6 +299,12 @@ endfunction()
 
 # Set properties on a clientlib target (either shared or static library)
 macro(set_clientlib_target_properties GNS_TARGET)
+    if(USE_IO_URING)
+        target_sources(${GNS_TARGET} PRIVATE steamnetworkingsockets/clientlib/steamnetworkingsockets_iouring.cpp)
+        target_compile_definitions(${GNS_TARGET} PRIVATE STEAMNETWORKINGSOCKETS_USE_IO_URING)
+        target_link_libraries(${GNS_TARGET} PRIVATE PkgConfig::LIBURING)
+    endif()
+
 
 	target_sources(${GNS_TARGET} PRIVATE
 		${GNS_COMMON_SRCS}

@@ -14,6 +14,10 @@
 
 #include "steamnetworkingsockets_lowlevel.h"
 #include "steamnetworkingsockets_mock.h"
+#include "steamnetworkingsockets_iouring.h"
+#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+#include <unordered_map>
+#endif
 #include <tier0/platform_sockets.h>
 #include "../steamnetworkingsockets_internal.h"
 #include "../steamnetworkingsockets_thinker.h"
@@ -377,6 +381,11 @@ bool sendto_gather( int sockfd, int nChunks, const iovec *pChunks, sockaddr *pAd
 }
 #endif
 
+#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+static std::unique_ptr<CUringUDPSocketIO> s_pUring;
+static bool s_bTriedUring;
+#endif
+
 class CRawUDPSocketImpl final : public IRawUDPSocket
 {
 public:
@@ -389,6 +398,9 @@ public:
 
 	/// Descriptor from the OS
 	SOCKET m_socket;
+	#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+	uint64_t m_nUringReceiver = 0;
+	#endif
 
 	/// What address families are supported by this socket?
 	int m_nAddressFamilies;
@@ -553,6 +565,16 @@ public:
 			COMPILE_TIME_ASSERT( !PlatformCanSendECN() );
 
 			bool bResult;
+			#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+			if ( s_pUring && m_nUringReceiver )
+			{
+				// Do not overtake queued packets with an inline fallback when the
+				// ring is full. Report backpressure so SNP can retry its packet.
+				bResult = s_pUring->QueueSend( m_nUringReceiver,
+					nChunks, pChunks, (sockaddr *)&destAddress, addrSize );
+			}
+			else
+			#endif
 			if ( nChunks == 1 )
 			{
 				ssize_t r = sendto( m_socket, pChunks->iov_base, pChunks->iov_len, 0, (sockaddr *)&destAddress, addrSize );
@@ -665,6 +687,9 @@ private:
 /// We don't expect to have enough sockets, and open and close them frequently
 /// enough, such that an occasional linear search will kill us.
 static CUtlVector<CRawUDPSocketImpl *> s_vecRawSockets;
+#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+static std::unordered_map<uint64_t, CRawUDPSocketImpl *> s_mapUringReceivers;
+#endif
 
 /// Are any sockets pending destruction?
 static bool s_bRawSocketPendingDestruction;
@@ -1296,6 +1321,14 @@ void CRawUDPSocketImpl::InternalAddToCleanupQueue()
 	Assert( m_callback.m_fnCallback );
 	m_callback.m_fnCallback = nullptr;
 	Assert( m_socket != INVALID_SOCKET );
+	#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+	if ( m_nUringReceiver )
+	{
+		s_pUring->Detach( m_nUringReceiver );
+		s_mapUringReceivers.erase( m_nUringReceiver );
+		m_nUringReceiver = 0;
+	}
+	#endif
 
 	// Set global flag to remember that at least once socket needs to be cleaned up
 	s_bRawSocketPendingDestruction = true;
@@ -2289,6 +2322,239 @@ IRawUDPSocket *OpenRawUDPSocket( CRecvPacketCallback callback, SteamNetworkingEr
 
 /// Draw one specific UDP socket.  Returns false if we detect a
 /// global shutdown attempt and abort
+// Dispatch both classic and multishot receives through the same tracing,
+// impairment, TOS and connection callback path.
+template <typename Message>
+static void DispatchRawUDPPacket( CRawUDPSocketImpl *pSock, char *buf,
+	iovec iov_buf, sockaddr_storage from, socklen_t fromlen,
+	SteamNetworkingMicroseconds usecRecvFromEnd, Message msg )
+{
+	// Emit ETW event
+	TraceLoggingWrite(
+		HTraceLogging_SteamNetworkingSockets,
+		"UDPRecv",
+		//TraceLoggingLevel( WINEVENT_LEVEL_INFO ),
+		TraceLoggingSocketAddress( &from, fromlen, "Addr" ),
+		TraceLoggingUInt16( (uint16)iov_buf.iov_len, "Bytes" ),
+		TraceLoggingBinary( buf, std::min( k_cbETWEventUDPPacketDataSize, (int)iov_buf.iov_len ), "Data" )
+	);
+
+	// Add a tag.  If we end up holding the lock for a long time, this tag
+	// will tell us how many packets were processed
+	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "RecvUDPPacket" );
+
+	// Check simulated global rate limit.  Make sure this is fast
+	// when the limit is not in use
+	if ( unlikely( GlobalConfig::FakeRateLimit_Recv_Rate.Get() > 0 ) )
+	{
+
+		// Check if bucket already has tokens in it, which
+		// will be common.  If so, we can avoid reading the
+		// timer
+		if ( s_flFakeRateLimit_Recv_tokens <= 0.0f )
+		{
+
+			// Update bucket with tokens
+			UpdateFakeRateLimitTokenBuckets( usecRecvFromEnd );
+
+			// Still empty?
+			if ( s_flFakeRateLimit_Recv_tokens <= 0.0f )
+				return;
+		}
+
+		// Spend tokens
+		s_flFakeRateLimit_Recv_tokens -= (int)iov_buf.iov_len;
+	}
+
+	// Check for simulating random packet loss
+	if ( RandomBoolWithOdds( GlobalConfig::FakePacketLoss_Recv.Get() ) )
+		return;
+
+	RecvPktInfo_t info;
+	info.m_adrFrom.SetFromSockadr( &from );
+
+	// Read the TOS field from the ancillary data.
+	info.m_tos = 0xff;
+	#if PlatformSupportsRecvMsg() && PlatformSupportsRecvTOS()
+	{
+		for ( cmsghdr *cmsg = CMSG_FIRSTHDR( &msg ); cmsg; cmsg = CMSG_NXTHDR( &msg, cmsg ) )
+		{
+
+			// Apple has a unique API for receiving the TOS data, and it differs between IPv4 and IPv6
+			#if defined(__APPLE__)
+
+				// And the field differs between IPv4 and IPv6
+				if ( cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVTOS )
+				{
+					AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(uint8) ), "Unexpected IP_RECVTOS cmsg_len %lld", (long long)cmsg->cmsg_len );
+					info.m_tos = *((uint8 *) CMSG_DATA(cmsg));
+					goto tos_done;
+				}
+
+				// IPv6 tclass
+				if (
+					cmsg->cmsg_level == IPPROTO_IPV6
+					&& (
+						cmsg->cmsg_type == IPV6_TCLASS
+
+						// Older versions of MacOS return the socket
+						// option ID instead of the cmsg ID.
+						|| cmsg->cmsg_type == IPV6_RECVTCLASS
+						#ifdef IP_RECVTCLASS
+							|| cmsg->cmsg_type == IP_RECVTCLASS
+						#endif
+					)
+				) {
+					AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IPv6 traffic-class (cmsg_type %d) cmsg_len %lld",
+						(int)cmsg->cmsg_type, (long long)cmsg->cmsg_len );
+					info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
+					goto tos_done;
+				}
+
+			#else
+				// IPv4 TOS: returned for AF_INET sockets, and for IPv4-mapped packets on
+				// Linux dual-stack AF_INET6 sockets.
+				if ( cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS )
+				{
+					#ifdef _WIN32
+						// Windows returns TOS as int
+						AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
+						info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
+					#else
+						// POSIX returns TOS as uint8
+						AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(uint8) ), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
+						info.m_tos = *((uint8 *) CMSG_DATA(cmsg));
+					#endif
+					goto tos_done;
+				}
+
+				// IPv6 traffic class: returned for pure IPv6 packets on Linux AF_INET6
+				// sockets, and for all packets (incl. IPv4-mapped) on Windows/Apple AF_INET6.
+				if ( cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS )
+				{
+					AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IPV6_TCLASS cmsg_len %lld", (long long)cmsg->cmsg_len );
+					info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
+					goto tos_done;
+				}
+			#endif
+		}
+
+		// If we get here, we scanned all control messages but didn't get the TOS data.
+		// Only assert if we successfully enabled TOS on this socket -- if the setsockopt
+		// failed we already warned at startup and shouldn't fire repeatedly here.
+		AssertMsgOnce( !pSock->m_bWarnIfNoTOSCMsg, "No control data returned even though we asked for TOS?" );
+	}
+	tos_done:
+	#endif
+
+	// If we're dual stack, convert mapped IPv4 back to ordinary IPv4
+	if ( pSock->m_nAddressFamilies == k_nAddressFamily_DualStack )
+		info.m_adrFrom.BConvertMappedToIPv4();
+
+	// Check for tracing
+	if ( GlobalConfig::PacketTraceMaxBytes.Get() >= 0 )
+	{
+		pSock->TracePkt( false, info.m_adrFrom, 1, &iov_buf );
+	}
+
+	// Read convars and decide if we're going to simulate any lag, jitter, reordering, or duplication
+	int msFakeLag = GlobalConfig::FakePacketLag_Recv.Get();
+	SteamNetworkingMicroseconds usecReorderLag = 0;
+	if ( RandomBoolWithOdds( GlobalConfig::FakePacketReorder_Recv.Get() ) )
+		usecReorderLag = GlobalConfig::FakePacketReorder_Time.Get()*1000;
+	SteamNetworkingMicroseconds usecJitter = RandomJitter( GlobalConfig::FakePacketJitter_Recv_Avg, GlobalConfig::FakePacketJitter_Recv_Max, GlobalConfig::FakePacketJitter_Recv_Pct );
+	bool bDup = RandomBoolWithOdds( GlobalConfig::FakePacketDup_Recv.Get() );
+
+	// Anything active?
+	static SteamNetworkingMicroseconds s_usecMinNextJitteredTime;
+	if ( unlikely( msFakeLag > 0 || usecReorderLag > 0 || usecJitter > 0 || bDup || s_usecMinNextJitteredTime != 0 ) )
+	{
+		SteamNetworkingMicroseconds usecNow = SteamNetworkingSockets_GetLocalTimestamp();
+		SteamNetworkingMicroseconds usecWhenProcess = usecNow + msFakeLag*1000;
+		usecJitter = std::max( usecJitter, s_usecMinNextJitteredTime - usecWhenProcess );
+		if ( usecJitter > 0 )
+		{
+			usecWhenProcess += usecJitter;
+			s_usecMinNextJitteredTime = usecWhenProcess + 1;
+		}
+		else
+		{
+			// End of clump, clear this so we can switch back to the
+			// fast path once options are turned off
+			s_usecMinNextJitteredTime = 0;
+		}
+		usecWhenProcess += usecReorderLag;
+
+		// Check for simulating random packet duplication
+		if ( bDup )
+		{
+			SteamNetworkingMicroseconds usecDupLag = 1 + (SteamNetworkingMicroseconds)WeakRandomFloat( 0.0f, GlobalConfig::FakePacketDup_TimeMax.Get()*1000.0f );
+			s_packetLagQueueRecv.LagPacket( pSock, info.m_adrFrom, usecWhenProcess + usecDupLag, 1, &iov_buf, info.m_tos );
+		}
+
+		// Lag the original packet?
+		if ( usecWhenProcess > usecNow )
+		{
+			s_packetLagQueueRecv.LagPacket( pSock, info.m_adrFrom, usecWhenProcess, 1, &iov_buf, info.m_tos );
+			return;
+		}
+	}
+
+	// Process the packet now
+	info.m_pPkt = buf;
+	info.m_cbPkt = (int)iov_buf.iov_len;
+	info.m_usecNow = usecRecvFromEnd;
+	info.m_pSock = pSock;
+	info.m_bQueuedForOutOfOrder = false;
+	pSock->m_callback( info );
+
+	#ifdef STEAMNETWORKINGSOCKETS_LOWLEVEL_TIME_SOCKET_CALLS
+		SteamNetworkingMicroseconds usecProcessPacketEnd = SteamNetworkingSockets_GetLocalTimestamp();
+		if ( usecProcessPacketEnd > s_usecIgnoreLongLockWaitTimeUntil )
+		{
+			SteamNetworkingMicroseconds usecProcessPacketElapsed = usecProcessPacketEnd - usecRecvFromEnd;
+			if ( usecProcessPacketElapsed > 1000 )
+			{
+				SpewWarning( "process packet took %.1fms\n", usecProcessPacketElapsed*1e-3 );
+				ETW_LongOp( "process packet", usecProcessPacketElapsed );
+			}
+		}
+	#endif
+}
+
+#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+static void DispatchUringPacket( void *, const CUringUDPSocketIO::Packet &packet )
+{
+	auto it = s_mapUringReceivers.find( packet.receiver );
+	if ( it == s_mapUringReceivers.end() || !it->second->m_callback.m_fnCallback )
+		return;
+	iovec buffer{ const_cast<void *>( packet.data ), packet.size };
+	DispatchRawUDPPacket( it->second, (char *)buffer.iov_base, buffer, packet.address,
+		packet.message.msg_namelen, SteamNetworkingSockets_GetLocalTimestamp(), packet.message );
+}
+
+// This runs on the issuing service thread. Shutdown joins that thread while
+// holding the global lock, so no other thread can mutate the socket registry.
+static void ResetUring()
+{
+	for ( auto *pSock: s_vecRawSockets )
+		pSock->m_nUringReceiver = 0;
+	s_mapUringReceivers.clear();
+	s_pUring.reset(); // cancels requests and waits before releasing buffers
+	s_bTriedUring = false;
+}
+static void PumpUring()
+{
+	s_pUring->Pump( DispatchUringPacket, nullptr );
+	if ( !s_pUring->Supported() )
+	{
+		SpewVerbose( "Multishot recvmsg unavailable; using classic UDP sockets.\n" );
+		ResetUring();
+		s_bTriedUring = true;
+	}
+}
+#endif
+
 static bool DrainSocket( CRawUDPSocketImpl *pSock )
 {
 
@@ -2396,196 +2662,12 @@ static bool DrainSocket( CRawUDPSocketImpl *pSock )
 		if ( ret < 0 )
 			break;
 
-		// Emit ETW event
-		TraceLoggingWrite(
-			HTraceLogging_SteamNetworkingSockets,
-			"UDPRecv",
-			//TraceLoggingLevel( WINEVENT_LEVEL_INFO ),
-			TraceLoggingSocketAddress( &from, msg.namelen, "Addr" ),
-			TraceLoggingUInt16( (uint16)iov_buf.iov_len, "Bytes" ),
-			TraceLoggingBinary( buf, std::min( k_cbETWEventUDPPacketDataSize, (int)iov_buf.iov_len ), "Data" )
-		);
-
-		// Add a tag.  If we end up holding the lock for a long time, this tag
-		// will tell us how many packets were processed
-		SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "RecvUDPPacket" );
-
-		// Check simulated global rate limit.  Make sure this is fast
-		// when the limit is not in use
-		if ( unlikely( GlobalConfig::FakeRateLimit_Recv_Rate.Get() > 0 ) )
-		{
-
-			// Check if bucket already has tokens in it, which
-			// will be common.  If so, we can avoid reading the
-			// timer
-			if ( s_flFakeRateLimit_Recv_tokens <= 0.0f )
-			{
-
-				// Update bucket with tokens
-				UpdateFakeRateLimitTokenBuckets( usecRecvFromEnd );
-
-				// Still empty?
-				if ( s_flFakeRateLimit_Recv_tokens <= 0.0f )
-					continue;
-			}
-
-			// Spend tokens
-			s_flFakeRateLimit_Recv_tokens -= ret;
-		}
-
-		// Check for simulating random packet loss
-		if ( RandomBoolWithOdds( GlobalConfig::FakePacketLoss_Recv.Get() ) )
-			continue;
-
-		RecvPktInfo_t info;
-		info.m_adrFrom.SetFromSockadr( &from );
-
-		// Read the TOS field from the ancillary data.
-		info.m_tos = 0xff;
-		#if PlatformSupportsRecvMsg() && PlatformSupportsRecvTOS()
-		{
-			for ( cmsghdr *cmsg = CMSG_FIRSTHDR( &msg ); cmsg; cmsg = CMSG_NXTHDR( &msg, cmsg ) )
-			{
-
-				// Apple has a unique API for receiving the TOS data, and it differs between IPv4 and IPv6
-				#if defined(__APPLE__)
-
-					// And the field differs between IPv4 and IPv6
-					if ( cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVTOS )
-					{
-						AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(uint8) ), "Unexpected IP_RECVTOS cmsg_len %lld", (long long)cmsg->cmsg_len );
-						info.m_tos = *((uint8 *) CMSG_DATA(cmsg));
-						goto tos_done;
-					}
-
-					// IPv6 tclass
-					if (
-						cmsg->cmsg_level == IPPROTO_IPV6
-						&& (
-							cmsg->cmsg_type == IPV6_TCLASS
-
-							// Older versions of MacOS return the socket
-							// option ID instead of the cmsg ID.
-							|| cmsg->cmsg_type == IPV6_RECVTCLASS
-							#ifdef IP_RECVTCLASS
-								|| cmsg->cmsg_type == IP_RECVTCLASS
-							#endif
-						)
-					) {
-						AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IPv6 traffic-class (cmsg_type %d) cmsg_len %lld",
-							(int)cmsg->cmsg_type, (long long)cmsg->cmsg_len );
-						info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
-						goto tos_done;
-					}
-
-				#else
-					// IPv4 TOS: returned for AF_INET sockets, and for IPv4-mapped packets on
-					// Linux dual-stack AF_INET6 sockets.
-					if ( cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS )
-					{
-						#ifdef _WIN32
-							// Windows returns TOS as int
-							AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
-							info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
-						#else
-							// POSIX returns TOS as uint8
-							AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(uint8) ), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
-							info.m_tos = *((uint8 *) CMSG_DATA(cmsg));
-						#endif
-						goto tos_done;
-					}
-
-					// IPv6 traffic class: returned for pure IPv6 packets on Linux AF_INET6
-					// sockets, and for all packets (incl. IPv4-mapped) on Windows/Apple AF_INET6.
-					if ( cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS )
-					{
-						AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IPV6_TCLASS cmsg_len %lld", (long long)cmsg->cmsg_len );
-						info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
-						goto tos_done;
-					}
-				#endif
-			}
-
-			// If we get here, we scanned all control messages but didn't get the TOS data.
-			// Only assert if we successfully enabled TOS on this socket -- if the setsockopt
-			// failed we already warned at startup and shouldn't fire repeatedly here.
-			AssertMsgOnce( !pSock->m_bWarnIfNoTOSCMsg, "No control data returned even though we asked for TOS?" );
-		}
-		tos_done:
-		#endif
-
-		// If we're dual stack, convert mapped IPv4 back to ordinary IPv4
-		if ( pSock->m_nAddressFamilies == k_nAddressFamily_DualStack )
-			info.m_adrFrom.BConvertMappedToIPv4();
-
-		// Check for tracing
-		if ( GlobalConfig::PacketTraceMaxBytes.Get() >= 0 )
-		{
-			pSock->TracePkt( false, info.m_adrFrom, 1, &iov_buf );
-		}
-
-		// Read convars and decide if we're going to simulate any lag, jitter, reordering, or duplication
-		int msFakeLag = GlobalConfig::FakePacketLag_Recv.Get();
-		SteamNetworkingMicroseconds usecReorderLag = 0;
-		if ( RandomBoolWithOdds( GlobalConfig::FakePacketReorder_Recv.Get() ) )
-			usecReorderLag = GlobalConfig::FakePacketReorder_Time.Get()*1000;
-		SteamNetworkingMicroseconds usecJitter = RandomJitter( GlobalConfig::FakePacketJitter_Recv_Avg, GlobalConfig::FakePacketJitter_Recv_Max, GlobalConfig::FakePacketJitter_Recv_Pct );
-		bool bDup = RandomBoolWithOdds( GlobalConfig::FakePacketDup_Recv.Get() );
-
-		// Anything active?
-		static SteamNetworkingMicroseconds s_usecMinNextJitteredTime;
-		if ( unlikely( msFakeLag > 0 || usecReorderLag > 0 || usecJitter > 0 || bDup || s_usecMinNextJitteredTime != 0 ) )
-		{
-			SteamNetworkingMicroseconds usecNow = SteamNetworkingSockets_GetLocalTimestamp();
-			SteamNetworkingMicroseconds usecWhenProcess = usecNow + msFakeLag*1000;
-			usecJitter = std::max( usecJitter, s_usecMinNextJitteredTime - usecWhenProcess );
-			if ( usecJitter > 0 )
-			{
-				usecWhenProcess += usecJitter;
-				s_usecMinNextJitteredTime = usecWhenProcess + 1;
-			}
-			else
-			{
-				// End of clump, clear this so we can switch back to the
-				// fast path once options are turned off
-				s_usecMinNextJitteredTime = 0;
-			}
-			usecWhenProcess += usecReorderLag;
-
-			// Check for simulating random packet duplication
-			if ( bDup )
-			{
-				SteamNetworkingMicroseconds usecDupLag = 1 + (SteamNetworkingMicroseconds)WeakRandomFloat( 0.0f, GlobalConfig::FakePacketDup_TimeMax.Get()*1000.0f );
-				s_packetLagQueueRecv.LagPacket( pSock, info.m_adrFrom, usecWhenProcess + usecDupLag, 1, &iov_buf, info.m_tos );
-			}
-
-			// Lag the original packet?
-			if ( usecWhenProcess > usecNow )
-			{
-				s_packetLagQueueRecv.LagPacket( pSock, info.m_adrFrom, usecWhenProcess, 1, &iov_buf, info.m_tos );
-				continue;
-			}
-		}
-
-		// Process the packet now
-		info.m_pPkt = buf;
-		info.m_cbPkt = (int)iov_buf.iov_len;
-		info.m_usecNow = usecRecvFromEnd;
-		info.m_pSock = pSock;
-		info.m_bQueuedForOutOfOrder = false;
-		pSock->m_callback( info );
-
-		#ifdef STEAMNETWORKINGSOCKETS_LOWLEVEL_TIME_SOCKET_CALLS
-			SteamNetworkingMicroseconds usecProcessPacketEnd = SteamNetworkingSockets_GetLocalTimestamp();
-			if ( usecProcessPacketEnd > s_usecIgnoreLongLockWaitTimeUntil )
-			{
-				SteamNetworkingMicroseconds usecProcessPacketElapsed = usecProcessPacketEnd - usecRecvFromEnd;
-				if ( usecProcessPacketElapsed > 1000 )
-				{
-					SpewWarning( "process packet took %.1fms\n", usecProcessPacketElapsed*1e-3 );
-					ETW_LongOp( "process packet", usecProcessPacketElapsed );
-				}
-			}
+		#if !PlatformSupportsRecvMsg()
+		DispatchRawUDPPacket( pSock, buf, iov_buf, from, fromlen, usecRecvFromEnd, 0 );
+		#elif defined( _WIN32 )
+		DispatchRawUDPPacket( pSock, buf, iov_buf, from, msg.namelen, usecRecvFromEnd, msg );
+		#else
+		DispatchRawUDPPacket( pSock, buf, iov_buf, from, msg.msg_namelen, usecRecvFromEnd, msg );
 		#endif
 	}
 
@@ -2641,6 +2723,37 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 			#endif
 		}
 		Assert( s_vecPollFDs.Count() == nSocketsToPoll+1 );
+	#endif
+
+	#if defined( STEAMNETWORKINGSOCKETS_USE_IO_URING ) && defined( USE_EPOLL )
+	if ( !bManualPoll )
+	{
+		if ( !s_bTriedUring )
+		{
+			s_bTriedUring = true;
+			s_pUring = CUringUDPSocketIO::Create();
+			if ( s_pUring )
+			{
+				epoll_event event{};
+				event.events = EPOLLIN;
+				event.data.ptr = (void *)uintptr_t(1);
+				if ( epoll_ctl( s_epollfd, EPOLL_CTL_ADD, s_pUring->WakeFD(), &event ) < 0 )
+					s_pUring.reset();
+				else
+					SpewVerbose( "Using io_uring multishot UDP socket backend.\n" );
+			}
+		}
+		if ( s_pUring )
+		{
+			for ( auto *pSock: s_vecRawSockets )
+				if ( !pSock->m_nUringReceiver )
+				{
+					pSock->m_nUringReceiver = s_pUring->AddReceiver( pSock->m_socket );
+					s_mapUringReceivers.emplace( pSock->m_nUringReceiver, pSock );
+				}
+			PumpUring();
+		}
+	}
 	#endif
 
 	// Release lock while we're asleep
@@ -2701,6 +2814,7 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 	// Now check on sockets.  When using epoll, we can do this more efficiently
 	#ifdef USE_EPOLL
 
+		const SteamNetworkingMicroseconds usecDispatchDeadline = SteamNetworkingSockets_GetLocalTimestamp() + 2000;
 		int tries = 0;
 		while ( num_epoll_events > 0 )
 		{
@@ -2719,7 +2833,21 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 				// to the socket there.
 				auto pSock = (CRawUDPSocketImpl *)epoll_events[ i ].data.ptr;
 
-				// Is it for a real socket, or just a wakuip call?
+				#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+				if ( pSock == (void *)uintptr_t(1) )
+				{
+					if ( s_pUring )
+						PumpUring();
+					continue;
+				}
+				if ( pSock && pSock->m_nUringReceiver )
+				{
+					PumpUring();
+					continue;
+				}
+				#endif
+
+				// Is it for a real socket, or just a wakeup call?
 				if ( pSock )
 				{
 					if ( !DrainSocket( pSock ) )
@@ -2741,6 +2869,11 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 					#endif
 				}
 			}
+
+			// Leave unread socket/CQ events registered for the next pass.
+			// Periodic work and application API calls need a bounded turn too.
+			if ( SteamNetworkingSockets_GetLocalTimestamp() >= usecDispatchDeadline )
+				break;
 
 			// Poll again, but don't block
 			num_epoll_events = epoll_wait( s_epollfd, epoll_events, V_ARRAYSIZE( epoll_events ), 0 );
@@ -3334,7 +3467,7 @@ static bool SteamNetworkingSockets_InternalPoll( int msWait, bool bManualPoll )
 	}
 
 	// Check for periodic processing
-	IThinker::Thinker_ProcessThinkers();
+	IThinker::Thinker_ProcessThinkers( 2000 );
 
 	// Check for various deferred operations
 	ProcessDeferredOperations();
@@ -3446,6 +3579,9 @@ static void SteamNetworkingThreadProc()
 		}
 	}
 
+	#ifdef STEAMNETWORKINGSOCKETS_USE_IO_URING
+	ResetUring();
+	#endif
 	SpewVerbose( "Service thread exiting.\n" );
 }
 

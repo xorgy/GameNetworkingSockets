@@ -49,7 +49,9 @@ public:
 	/// Try to acquire our lock.  Returns false if we fail.
 	virtual bool TryLock() const;
 
-	static void Thinker_ProcessThinkers();
+	// Bound one service pass so socket I/O and application threads cannot be
+	// starved by a large set of connections continuously scheduling work.
+	static void Thinker_ProcessThinkers( SteamNetworkingMicroseconds usecBudget = 0 );
 	static SteamNetworkingMicroseconds Thinker_GetNextScheduledThinkTime();
 protected:
 	IThinker();
